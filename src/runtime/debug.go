@@ -55,7 +55,7 @@ func NumCgoCall() int64 {
 
 // NumGoroutine returns the number of goroutines that currently exist.
 func NumGoroutine() int {
-	return int(gcount())
+	return int(gcount(false))
 }
 
 //go:linkname debug_modinfo runtime/debug.modinfo

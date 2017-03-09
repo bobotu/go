@@ -46,6 +46,10 @@ const (
 	// _Gsyscall means this goroutine is executing a system call.
 	// It is not executing user code. The stack is owned by this
 	// goroutine. It is not on a run queue. It is assigned an M.
+	//
+	// Any time the G status is changed to or from _Gsyscall
+	// without also changing the P's status to or from _Psyscall,
+	// you must also modify sched.nGsyscallNoP (q.v.).
 	_Gsyscall // 3
 
 	// _Gwaiting means this goroutine is blocked in the runtime.
@@ -152,6 +156,10 @@ const (
 	// stripped of its resources, though a few things remain
 	// (e.g., trace buffers).
 	_Pdead
+
+	// Any time the P status is changed to or from _Psyscall
+	// without also changing a G's status to or from _Gsyscall,
+	// you must also modify sched.nGsyscallNoP (q.v.).
 )
 
 // Mutual exclusion locks.  In the uncontended case,
@@ -700,6 +708,21 @@ type schedt struct {
 	goidgen   uint64
 	lastpoll  uint64 // time of last network poll, 0 if currently polling
 	pollUntil uint64 // time to which current poll is sleeping
+
+	// nGsyscallNoP is the number of Gs in _Gsyscall minus the
+	// number of Ps in _Psyscall. This is updated atomically
+	// whenever one of these changes without the other changing.
+	// This is defined as a difference because the syscall fast
+	// paths always change both together, so only the slow paths
+	// need to modify the difference.
+	//
+	// This is used by ReadSchedStats to determine the number of
+	// goroutines in _Gsyscall by only counting the number of Ps
+	// in _Psyscall.
+	//
+	// Currently no attempt is made to keep updates to this
+	// causal, so it may temporarily go negative.
+	nGsyscallNoP uint32
 
 	lock mutex
 

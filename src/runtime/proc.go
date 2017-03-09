@@ -999,6 +999,8 @@ func stopTheWorldWithSema() {
 			}
 			p.syscalltick++
 			sched.stopwait--
+			// The P is no longer in _Psyscall, but the G still is.
+			atomic.Xadd(&sched.nGsyscallNoP, +1)
 		}
 	}
 	// stop idle P's
@@ -1353,6 +1355,8 @@ func forEachP(fn func(*p)) {
 				traceProcStop(p)
 			}
 			p.syscalltick++
+			// The P is no longer in _Psyscall, but the G still is.
+			atomic.Xadd(&sched.nGsyscallNoP, +1)
 			handoffp(p)
 		}
 	}
@@ -1571,6 +1575,7 @@ func needm(x byte) {
 
 	// mp.curg is now a real goroutine.
 	casgstatus(mp.curg, _Gdead, _Gsyscall)
+	atomic.Xadd(&sched.nGsyscallNoP, +1)
 	atomic.Xadd(&sched.ngsys, -1)
 }
 
@@ -1674,6 +1679,7 @@ func dropm() {
 	// Return mp.curg to dead state.
 	casgstatus(mp.curg, _Gsyscall, _Gdead)
 	mp.curg.preemptStop = false
+	atomic.Xadd(&sched.nGsyscallNoP, -1)
 	atomic.Xadd(&sched.ngsys, +1)
 
 	// Block signals before unminit.
@@ -3150,6 +3156,8 @@ func entersyscall_gcwait() {
 		if sched.stopwait--; sched.stopwait == 0 {
 			notewakeup(&sched.stopnote)
 		}
+		// The P is no longer in _Psyscall, but the G still is.
+		atomic.Xadd(&sched.nGsyscallNoP, +1)
 	}
 	unlock(&sched.lock)
 }
@@ -3181,6 +3189,11 @@ func entersyscallblock() {
 			throw("entersyscallblock")
 		})
 	}
+
+	// This puts the G into _Gsyscall, but the P will never enter
+	// _Psyscall, so increment nGsyscallNoP.
+	atomic.Xadd(&sched.nGsyscallNoP, +1)
+
 	casgstatus(_g_, _Grunning, _Gsyscall)
 	if _g_.syscallsp < _g_.stack.lo || _g_.stack.hi < _g_.syscallsp {
 		systemstack(func() {
@@ -3236,7 +3249,11 @@ func exitsyscall() {
 		}
 		// There's a cpu for us, so we can run.
 		_g_.m.p.ptr().syscalltick++
-		// We need to cas the status and scan before resuming...
+		// We need to cas the status before resuming...
+		//
+		// It's up to exitsyscallfast to manipulate
+		// sched.nGsyscallNoP on all paths that *don't*
+		// transition a P out of _Gsyscall.
 		casgstatus(_g_, _Gsyscall, _Grunning)
 
 		// Garbage collector isn't running (since we are),
@@ -3299,10 +3316,25 @@ func exitsyscallfast(oldp *p) bool {
 		return false
 	}
 
+	// Any path below that returns true *without* transitioning a
+	// P out of _Psyscall must decrement sched.nGsyscallNoP, since
+	// returning true will transition the G out of _Gsyscall.
+
 	// Try to re-acquire the last P.
 	if oldp != nil && oldp.status == _Psyscall && atomic.Cas(&oldp.status, _Psyscall, _Pidle) {
 		// There's a cpu for us, so we can run.
 		wirep(oldp)
+		//
+		// Note that something else may have run on this P in
+		// the interim. All we know is that it's in *some*
+		// system call; not necessarily ours.
+		//
+		// However, even if the P was stolen and we're now
+		// taking it back, we don't need to modify
+		// sched.nGsyscallNoP because we're still
+		// transitioning both a P and a G out of syscall. In
+		// other words, *which* G is in a syscall without a P
+		// is changing, but not the number of them.
 		exitsyscallfast_reacquired()
 		return true
 	}
@@ -3362,6 +3394,11 @@ func exitsyscallfast_pidle() bool {
 	}
 	unlock(&sched.lock)
 	if _p_ != nil {
+		// This G lost its P, but now it has one. The caller
+		// will transition the G out of _Gsyscall, but we're
+		// acquiring a P that's not in _Psyscall here, so
+		// decrement nGsyscallNoP.
+		atomic.Xadd(&sched.nGsyscallNoP, -1)
 		acquirep(_p_)
 		return true
 	}
@@ -3374,6 +3411,11 @@ func exitsyscallfast_pidle() bool {
 //go:nowritebarrierrec
 func exitsyscall0(gp *g) {
 	_g_ := getg()
+
+	// This G is transitioning out of _Gsyscall without taking a P
+	// out of _Psyscall (because it lost its P), so decrement
+	// sched.nGsyscallNoP.
+	atomic.Xadd(&sched.nGsyscallNoP, -1)
 
 	casgstatus(gp, _Gsyscall, _Grunnable)
 	dropg()
@@ -3885,8 +3927,11 @@ func badunlockosthread() {
 	throw("runtime: internal error: misuse of lockOSThread/unlockOSThread")
 }
 
-func gcount() int32 {
-	n := int32(allglen) - sched.gFree.n - int32(atomic.Load(&sched.ngsys))
+func gcount(includeSys bool) int32 {
+	n := int32(allglen) - sched.gFree.n
+	if !includeSys {
+		n -= int32(atomic.Load(&sched.ngsys))
+	}
 	for _, _p_ := range allp {
 		n -= _p_.gFree.n
 	}
@@ -4802,6 +4847,8 @@ func retake(now int64) uint32 {
 				}
 				n++
 				_p_.syscalltick++
+				// The P is no longer in _Psyscall, but the G still is.
+				atomic.Xadd(&sched.nGsyscallNoP, +1)
 				handoffp(_p_)
 			}
 			incidlelocked(1)

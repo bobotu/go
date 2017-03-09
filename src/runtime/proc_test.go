@@ -1088,3 +1088,134 @@ func TestBigGOMAXPROCS(t *testing.T) {
 		t.Errorf("output:\n%s\nwanted:\nunknown function: NonexistentTest", output)
 	}
 }
+
+func TestSchedStats(t *testing.T) {
+	var st runtime.SchedStats
+
+	// blockedSlack is the max number of blocked goroutines left
+	// from other tests, the testing package, or system
+	// goroutines.
+	const blockedSlack = 100
+
+	// Make sure GC isn't running, since GC workers interfere with
+	// expected counts.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	runtime.GC()
+
+	check := func(t *testing.T, name string, val, min, max int) {
+		if val < min {
+			t.Errorf("%s too low; %d < %d", name, val, min)
+		}
+		if val > max {
+			t.Errorf("%s too high; %d > %d", name, val, max)
+		}
+	}
+
+	// Sanity check base values.
+	t.Run("base", func(t *testing.T) {
+		ps := runtime.GOMAXPROCS(1)
+		defer runtime.GOMAXPROCS(ps)
+		runtime.ReadSchedStats(&st, runtime.SchedStatsStates)
+		t.Logf("%+v", st)
+		check(t, "States.Running", st.States.Running, 1, 4)
+		check(t, "States.Runnable", st.States.Runnable, 0, ps)
+		check(t, "States.NonGo", st.States.NonGo, 0, 4)
+		check(t, "States.Blocked", st.States.Blocked, 0, blockedSlack)
+	})
+
+	// Force Running count to be high. We'll use these goroutines
+	// for Runnable, too.
+	const count = 10
+	var ready, exit uint32
+	for i := 0; i < count-1; i++ {
+		go func() {
+			atomic.AddUint32(&ready, +1)
+			for atomic.LoadUint32(&exit) == 0 {
+				runtime.Gosched()
+			}
+		}()
+	}
+	for atomic.LoadUint32(&ready) < count-1 {
+		runtime.Gosched()
+	}
+
+	t.Run("running", func(t *testing.T) {
+		if runtime.GOOS == "nacl" {
+			t.Skip("nacl is limited to 1 thread")
+		}
+		defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(count + 4))
+		// It can take a little bit for the scheduler to
+		// distribute the goroutines to Ps, so retry for a
+		// while.
+		for retry := 0; retry < 100; retry++ {
+			runtime.ReadSchedStats(&st, runtime.SchedStatsStates)
+			if st.States.Running >= count {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Logf("%+v", st)
+		check(t, "States.Running", st.States.Running, count, count+4)
+	})
+
+	// Force Runnable count to be high.
+	t.Run("runnable", func(t *testing.T) {
+		defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+		runtime.ReadSchedStats(&st, runtime.SchedStatsStates)
+		t.Logf("%+v", st)
+		check(t, "States.Running", st.States.Running, 1, 1)
+		check(t, "States.Runnable", st.States.Runnable, count-1, count+4)
+	})
+
+	// Done with the running/runnable goroutines.
+	atomic.StoreUint32(&exit, 1)
+
+	// Force NonGo count to be high. This is a little tricky since
+	// we try really hard not to let things block in system calls.
+	// We have to drop to the syscall package to do this reliably.
+	t.Run("nongo", func(t *testing.T) {
+		if runtime.GOOS == "nacl" {
+			t.Skip("nacl is limited to 1 thread")
+		}
+		pr, pw, err := pipe()
+		if err != nil {
+			t.Fatal("creating pipe:", err)
+		}
+		for i := 0; i < count; i++ {
+			go syscall.Read(pr, make([]byte, 1))
+			// Let it block.
+			for j := 0; j < 5; j++ {
+				runtime.Gosched()
+			}
+		}
+		runtime.ReadSchedStats(&st, runtime.SchedStatsStates)
+		t.Logf("%+v", st)
+		check(t, "States.NonGo", st.States.NonGo, count, count+4)
+		syscall.Close(pw)
+		syscall.Close(pr)
+	})
+
+	// Force Blocked count to be high.
+	const blockedCount = 1000
+	stop = make(chan bool)
+	for i := 0; i < blockedCount; i++ {
+		go func() { <-stop }()
+		// Let it block.
+		for j := 0; j < 5; j++ {
+			runtime.Gosched()
+		}
+	}
+	t.Run("blocked", func(t *testing.T) {
+		runtime.ReadSchedStats(&st, runtime.SchedStatsStates)
+		t.Logf("%+v", st)
+		check(t, "States.Blocked", st.States.Blocked, blockedCount, blockedCount+blockedSlack)
+	})
+	close(stop)
+}
+
+func BenchmarkReadSchedStats(b *testing.B) {
+	var ss runtime.SchedStats
+	for i := 0; i < b.N; i++ {
+		runtime.ReadSchedStats(&ss, runtime.SchedStatsStates)
+	}
+}
