@@ -187,6 +187,7 @@ func gcinit() {
 
 	// Set gcpercent from the environment. This will also compute
 	// and set the GC trigger and goal.
+	maxHeap = readMaxHeap()
 	_ = setGCPercent(readgogc())
 
 	work.startSema = 1
@@ -205,6 +206,14 @@ func readgogc() int32 {
 		return n
 	}
 	return 100
+}
+
+func readMaxHeap() uintptr {
+	p := gogetenv("GOMAXHEAP")
+	if n, ok := atoi(p); ok {
+		return uintptr(n)
+	}
+	return ^uintptr(0)
 }
 
 // gcenable is called after the bulk of the runtime initialization,
@@ -750,6 +759,8 @@ func pollFractionalWorkerExit() bool {
 	return float64(selfTime)/float64(delta) > 1.2*gcController.fractionalUtilizationGoal
 }
 
+var maxHeap = ^uintptr(0)
+
 // gcSetTriggerRatio sets the trigger ratio and updates everything
 // derived from it: the absolute trigger, the heap goal, mark pacing,
 // and sweep pacing.
@@ -762,6 +773,13 @@ func pollFractionalWorkerExit() bool {
 //
 // mheap_.lock must be held or the world must be stopped.
 func gcSetTriggerRatio(triggerRatio float64) {
+	// Since GOGC ratios are in terms of heap_marked, make sure it
+	// isn't 0. This shouldn't happen, but if it does we want to
+	// avoid infinities and divide-by-zeroes.
+	if memstats.heap_marked == 0 {
+		memstats.heap_marked = 1
+	}
+
 	// Compute the next GC goal, which is when the allocated heap
 	// has grown by GOGC/100 over the heap marked by the last
 	// cycle.
@@ -770,14 +788,52 @@ func gcSetTriggerRatio(triggerRatio float64) {
 		goal = memstats.heap_marked + memstats.heap_marked*uint64(gcpercent)/100
 	}
 
+	if maxHeap != ^uintptr(0) && goal > uint64(maxHeap) { // Careful of 32-bit uintptr!
+		// Use maxHeap-based goal.
+		goal = uint64(maxHeap)
+
+		// Avoid thrashing by not letting the
+		// effective GOGC drop below 10.
+		//
+		// TODO(austin): This heuristic is pulled from
+		// thin air. It might be better to do
+		// something to more directly force
+		// amortization of GC costs, e.g., by limiting
+		// what fraction of the time GC can be active.
+		var minGOGC uint64 = 10
+		if gcpercent >= 0 && uint64(gcpercent) < minGOGC {
+			// The user explicitly requested
+			// GOGC < minGOGC. Use that.
+			minGOGC = uint64(gcpercent)
+		}
+		lowerBound := memstats.heap_marked + memstats.heap_marked*minGOGC/100
+		if goal < lowerBound {
+			goal = lowerBound
+		}
+	}
+
 	// Set the trigger ratio, capped to reasonable bounds.
-	if gcpercent >= 0 {
-		scalingFactor := float64(gcpercent) / 100
+	if triggerRatio < 0 {
+		// This can happen if the mutator is allocating very
+		// quickly or the GC is scanning very slowly.
+		triggerRatio = 0
+	} else if gcpercent >= 0 && triggerRatio > float64(gcpercent)/100 {
+		// Cap trigger ratio at GOGC/100.
+		triggerRatio = float64(gcpercent) / 100
+	}
+	memstats.triggerRatio = triggerRatio
+
+	// Compute the absolute GC trigger from the trigger ratio.
+	//
+	// We trigger the next GC cycle when the allocated heap has
+	// grown by the trigger ratio over the marked heap size.
+	trigger := ^uint64(0)
+	if goal != ^uint64(0) {
+		trigger = uint64(float64(memstats.heap_marked) * (1 + triggerRatio))
 		// Ensure there's always a little margin so that the
 		// mutator assist ratio isn't infinity.
-		maxTriggerRatio := 0.95 * scalingFactor
-		if triggerRatio > maxTriggerRatio {
-			triggerRatio = maxTriggerRatio
+		if trigger > goal*95/100 {
+			trigger = goal * 95 / 100
 		}
 
 		// If we let triggerRatio go too low, then if the application
@@ -792,30 +848,14 @@ func gcSetTriggerRatio(triggerRatio float64) {
 		// fast/scalable allocator with 48 Ps that could drive the trigger ratio
 		// to <0.05, this constant causes applications to retain the same peak
 		// RSS compared to not having this allocator.
-		minTriggerRatio := 0.6 * scalingFactor
-		if triggerRatio < minTriggerRatio {
-			triggerRatio = minTriggerRatio
+		const minTriggerRatio = 0.6
+		minTrigger := memstats.heap_marked + uint64(minTriggerRatio*float64(goal-memstats.heap_marked))
+		if trigger < minTrigger {
+			trigger = minTrigger
 		}
-	} else if triggerRatio < 0 {
-		// gcpercent < 0, so just make sure we're not getting a negative
-		// triggerRatio. This case isn't expected to happen in practice,
-		// and doesn't really matter because if gcpercent < 0 then we won't
-		// ever consume triggerRatio further on in this function, but let's
-		// just be defensive here; the triggerRatio being negative is almost
-		// certainly undesirable.
-		triggerRatio = 0
-	}
-	memstats.triggerRatio = triggerRatio
 
-	// Compute the absolute GC trigger from the trigger ratio.
-	//
-	// We trigger the next GC cycle when the allocated heap has
-	// grown by the trigger ratio over the marked heap size.
-	trigger := ^uint64(0)
-	if gcpercent >= 0 {
-		trigger = uint64(float64(memstats.heap_marked) * (1 + triggerRatio))
 		// Don't trigger below the minimum heap size.
-		minTrigger := heapminimum
+		minTrigger = heapminimum
 		if !isSweepDone() {
 			// Concurrent sweep happens in the heap growth
 			// from heap_live to gc_trigger, so ensure
