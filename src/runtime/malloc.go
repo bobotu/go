@@ -981,6 +981,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	var span *mspan
 	var x unsafe.Pointer
 	noscan := typ == nil || typ.ptrdata == 0
+	var delayedZeroing bool
 	if size <= maxSmallSize {
 		if noscan && size < maxTinySize {
 			// Tiny allocator.
@@ -1068,8 +1069,10 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	} else {
 		shouldhelpgc = true
 		systemstack(func() {
-			span = largeAlloc(size, needzero, noscan)
+			span = largeAlloc(size, needzero && !noscan, noscan)
 		})
+		delayedZeroing = span.needzero != 0 // Only possible if needed zeroing and noscan; preserves zero-from-OS optimization.
+		span.needzero = 0
 		span.freeindex = 1
 		span.allocCount = 1
 		x = unsafe.Pointer(span.base())
@@ -1128,6 +1131,22 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	mp.mallocing = 0
 	releasem(mp)
 
+	// Pointerfree data can be zeroed late in a context where preemption can occur.
+	// x will keep the memory alive.
+	if delayedZeroing {
+		v := uintptr(x)
+		const lump = 1024 * 1024
+		for off := uintptr(0); off < size; off += lump {
+			max := size - off
+			if max > lump {
+				max = lump
+				noOpNoInline() // perhaps we need to reschedule
+			}
+			voff := v + off
+			memclrNoHeapPointers(unsafe.Pointer(voff), max)
+		}
+	}
+
 	if debug.allocfreetrace != 0 {
 		tracealloc(x, size, typ)
 	}
@@ -1155,6 +1174,17 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	}
 
 	return x
+}
+
+var never bool // always false, so that noOpNoInline will include a preemption check (till we get tail call elimination)
+
+// noOpNoInline is just a preemption check.
+//go:noinline
+func noOpNoInline() {
+	if never {
+		noOpNoInline()
+	}
+	return
 }
 
 func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {

@@ -910,8 +910,8 @@ func (h *mheap) alloc(npages uintptr, spanclass spanClass, needzero bool) *mspan
 	if s != nil {
 		if needzero && s.needzero != 0 {
 			memclrNoHeapPointers(unsafe.Pointer(s.base()), s.npages<<_PageShift)
+			s.needzero = 0
 		}
-		s.needzero = 0
 	}
 	return s
 }
